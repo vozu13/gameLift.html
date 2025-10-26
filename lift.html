@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>LIFT — башня из плиток</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #0e0f13; color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol'; }
+    .wrap { position: fixed; inset: 0; display: grid; grid-template-rows: auto 1fr; }
+    header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0)); border-bottom: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(6px); z-index: 2; }
+    header h1 { margin: 0; font-size: 18px; letter-spacing: 0.8px; font-weight: 700; }
+    header .stats { display: flex; gap: 12px; font-size: 14px; opacity: 0.9; }
+    canvas { width: 100%; height: 100%; display: block; touch-action: manipulation; }
+    .hint { position: absolute; inset: auto 0 14px 0; text-align: center; font-size: 14px; opacity: 0.7; pointer-events: none; }
+    .btn { appearance: none; border: 0; background: #1d9bf0; color: white; padding: 8px 12px; border-radius: 10px; font-weight: 600; cursor: pointer; box-shadow: 0 6px 20px rgba(29,155,240,0.3); }
+    .btn:active { transform: translateY(1px); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>LIFT</h1>
+      <div class="stats">
+        <div>Очки: <span id="score">0</span></div>
+        <div>Рекорд: <span id="best">0</span></div>
+        <button id="restart" class="btn" title="Начать заново">↻</button>
+      </div>
+    </header>
+    <canvas id="game"></canvas>
+    <div class="hint" id="hint">Нажмите/тапните, чтобы уронить плитку</div>
+  </div>
+
+  <script>
+    // --- Базовые настройки ---
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('score');
+    const bestEl = document.getElementById('best');
+    const restartBtn = document.getElementById('restart');
+    const hintEl = document.getElementById('hint');
+
+    let W = 0, H = 0, DPR = Math.max(1, window.devicePixelRatio || 1);
+    function resize() {
+      W = canvas.clientWidth; H = canvas.clientHeight;
+      canvas.width = Math.round(W * DPR);
+      canvas.height = Math.round(H * DPR);
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    }
+    window.addEventListener('resize', resize, { passive: true });
+    resize();
+
+    // --- Игровые переменные ---
+    const TILE_H = 30; // высота плитки в пикселях экрана
+    let baseTileWidth; // стартовая ширина плитки
+
+    const tiles = []; // все зафиксированные плитки
+    let mover = null; // текущая движущаяся плитка (до сброса)
+    let state = 'play'; // 'play' | 'fall' | 'over'
+    let score = 0; let best = Number(localStorage.getItem('lift-best') || 0); bestEl.textContent = best;
+
+    let camY = 0; // текущее смещение камеры (минимум 0)
+    let camTargetY = 0;
+
+    function worldToScreenY(y) {
+      // мир: 0 = основание; растем вверх
+      return H - (y - camY);
+    }
+
+    function resetGame() {
+      state = 'play';
+      score = 0; scoreEl.textContent = '0';
+      tiles.length = 0;
+      camY = 0; camTargetY = 0;
+      hintEl.style.opacity = 0.8;
+
+      baseTileWidth = Math.max(120, Math.min(320, Math.floor(W * 0.6)));
+      // создаем базовую плитку-основание
+      const base = {
+        x: (W - baseTileWidth) / 2,
+        y: 0,
+        w: baseTileWidth,
+        h: TILE_H,
+        color: '#3ddc84' // зелёная база
+      };
+      tiles.push(base);
+      spawnMover();
+    }
+
+    function spawnMover() {
+      // Новая плитка выше текущей вершины
+      const topIndex = tiles.length - 1;
+      const topTile = tiles[topIndex];
+      const y = (topIndex + 1) * TILE_H;
+      const speed = 90 + Math.min(280, topIndex * 8); // пикс/сек
+
+      // начальная ширина = ширина предыдущей плитки
+      const w = topTile.w;
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      const margin = 12;
+      const xStart = dir > 0 ? margin : W - w - margin;
+
+      mover = {
+        x: xStart,
+        y,
+        w,
+        h: TILE_H,
+        vx: speed * dir,
+        falling: false,
+        vy: 0,
+        color: nextColor(topIndex + 1)
+      };
+
+      // Камера: держим на экране последние 10 плиток
+      const visibleTiles = 10;
+      const currentCount = tiles.length;
+      const desiredBottom = Math.max(0, (currentCount - visibleTiles) * TILE_H);
+      camTargetY = desiredBottom;
+    }
+
+    // Простой генератор приятных цветов по индексу
+    function nextColor(i) {
+      const hue = (i * 37) % 360; // разнести по кругу
+      return `hsl(${hue} 80% 55%)`;
+    }
+
+    // Управление: клик/тап — уронить плитку или рестарт
+    function handleAction() {
+      if (state === 'over') { resetGame(); return; }
+      if (!mover || mover.falling) return;
+      mover.falling = true;
+      mover.vy = 800; // пикс/сек — скорость падения
+      hintEl.style.opacity = 0; // спрятать подсказку
+    }
+    canvas.addEventListener('click', handleAction);
+    canvas.addEventListener('touchstart', (e) => { e.preventDefault(); handleAction(); }, { passive: false });
+    restartBtn.addEventListener('click', (e)=>{ e.stopPropagation(); resetGame(); });
+
+    // Основной цикл
+    let last = performance.now();
+    function loop(now) {
+      const dt = Math.min(0.033, (now - last) / 1000);
+      last = now;
+
+      update(dt);
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    function update(dt) {
+      // Плавное движение камеры к цели
+      const camSpeed = 6; // сглаживание
+      camY += (camTargetY - camY) * Math.min(1, camSpeed * dt);
+
+      if (state === 'over') return;
+
+      if (mover && !mover.falling) {
+        mover.x += mover.vx * dt;
+        if (mover.x <= 0) { mover.x = 0; mover.vx = Math.abs(mover.vx); }
+        if (mover.x + mover.w >= W) { mover.x = W - mover.w; mover.vx = -Math.abs(mover.vx); }
+      }
+
+      if (mover && mover.falling) {
+        mover.y -= mover.vy * dt; // y растет вверх, поэтому падаем вниз — минус
+        const targetY = tiles.length * TILE_H; // верх предыдущей стопки + высота плитки
+        if (mover.y <= targetY) {
+          // Соприкосновение: фиксируем по Y
+          mover.y = targetY;
+          placeMover();
+        }
+      }
+    }
+
+    function placeMover() {
+      const prev = tiles[tiles.length - 1];
+      // Вычисляем перекрытие по X между mover и prev
+      const left = Math.max(prev.x, mover.x);
+      const right = Math.min(prev.x + prev.w, mover.x + mover.w);
+      const overlap = right - left;
+
+      if (overlap <= 0) {
+        // Промах — конец игры
+        gameOver();
+        return;
+      }
+
+      // Обрезаем плитку до перекрытия
+      mover.x = left;
+      mover.w = overlap;
+      mover.falling = false;
+      tiles.push({ x: mover.x, y: mover.y, w: mover.w, h: mover.h, color: mover.color });
+      score = tiles.length - 1; // не считаем базу
+      scoreEl.textContent = score;
+      if (score > best) { best = score; localStorage.setItem('lift-best', best); bestEl.textContent = best; }
+
+      // Поднимаем "камеру", если плиток > 10
+      const visibleTiles = 10;
+      if (tiles.length > visibleTiles) {
+        camTargetY = (tiles.length - visibleTiles) * TILE_H;
+      }
+
+      // Новая движущаяся плитка
+      spawnMover();
+    }
+
+    function gameOver() {
+      state = 'over';
+      // слегка опускаем камеру, чтобы видеть промах
+      camTargetY = Math.max(0, camTargetY - TILE_H * 0.6);
+      hintEl.textContent = 'Промах! Нажмите, чтобы начать заново';
+      hintEl.style.opacity = 0.9;
+    }
+
+    function drawGrid() {
+      ctx.save();
+      ctx.lineWidth = 1;
+      ctx.globalAlpha = 0.12;
+      ctx.beginPath();
+      const step = TILE_H;
+      const startY = Math.floor(camY / step) * step;
+      for (let y = startY; y < camY + H + step; y += step) {
+        const sy = worldToScreenY(y);
+        ctx.moveTo(0, sy);
+        ctx.lineTo(W, sy);
+      }
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function draw() {
+      // Фон — мягкий градиент
+      const grad = ctx.createLinearGradient(0, 0, 0, H);
+      grad.addColorStop(0, '#0e0f13');
+      grad.addColorStop(1, '#12131a');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, W, H);
+
+      drawGrid();
+
+      // Рисуем все зафиксированные плитки
+      for (let i = 0; i < tiles.length; i++) {
+        const t = tiles[i];
+        const syTop = worldToScreenY(t.y + t.h);
+        const syBottom = worldToScreenY(t.y);
+        ctx.fillStyle = t.color;
+        // Тень
+        ctx.save();
+        ctx.globalAlpha = 0.18;
+        ctx.fillRect(t.x + 4, syTop + 4, t.w, syBottom - syTop);
+        ctx.restore();
+        // Сам блок
+        ctx.fillRect(t.x, syTop, t.w, syBottom - syTop);
+      }
+
+      // Рисуем движущуюся плитку
+      if (mover) {
+        const syTop = worldToScreenY(mover.y + mover.h);
+        const syBottom = worldToScreenY(mover.y);
+        ctx.fillStyle = mover.color;
+        ctx.save();
+        ctx.globalAlpha = 0.22;
+        ctx.fillRect(mover.x + 4, syTop + 4, mover.w, syBottom - syTop);
+        ctx.restore();
+        ctx.fillRect(mover.x, syTop, mover.w, syBottom - syTop);
+
+        // Указатель (стрелка) сверху, пока плитка летает горизонтально
+        if (!mover.falling) {
+          const arrowY = syTop - 16;
+          ctx.beginPath();
+          ctx.moveTo(mover.x + mover.w * 0.5, arrowY);
+          ctx.lineTo(mover.x + mover.w * 0.5 - 6, arrowY + 10);
+          ctx.lineTo(mover.x + mover.w * 0.5 + 6, arrowY + 10);
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(255,255,255,0.6)';
+          ctx.fill();
+        }
+      }
+
+      // Линия низа (y=0)
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      const groundY = worldToScreenY(0);
+      ctx.fillRect(0, groundY, W, 2);
+    }
+
+    // Старт
+    resetGame();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
